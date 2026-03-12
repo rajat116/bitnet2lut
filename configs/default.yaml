@@ -1,0 +1,70 @@
+# bitnet2lut default configuration
+# Override any setting via CLI flags
+
+model:
+  hf_repo: "microsoft/bitnet-b1.58-2B-4T-bf16"
+  # Architecture (from config.json, for reference/validation)
+  hidden_size: 2560
+  intermediate_size: 6912
+  num_hidden_layers: 30
+  num_attention_heads: 20
+  num_key_value_heads: 5
+  vocab_size: 128256
+  max_position_embeddings: 4096
+  rope_theta: 500000.0
+  rms_norm_eps: 1.0e-5
+  tie_word_embeddings: true
+
+extract:
+  # Layers to extract (null = all)
+  layers: null
+  # Which linear projections to extract
+  projections:
+    - "self_attn.q_proj"
+    - "self_attn.k_proj"
+    - "self_attn.v_proj"
+    - "self_attn.o_proj"
+    - "mlp.gate_proj"
+    - "mlp.up_proj"
+    - "mlp.down_proj"
+  # Save per-layer statistics
+  save_stats: true
+
+tile:
+  # Block size for FPGA BRAM tiling (rows x cols)
+  block_rows: 128
+  block_cols: 128
+  # Padding strategy for edge tiles: "zero" or "none"
+  pad_strategy: "zero"
+
+lut:
+  # Number of ternary weights per LUT group
+  group_size: 4
+  # Number of LUT entries = 3^group_size = 81 for g=4
+  # Output data type for LUT entries
+  lut_dtype: "int16"
+  # Whether to also generate INT8 quantized LUTs (for area savings)
+  generate_int8_luts: false
+
+export:
+  # FPGA target
+  backend: "fpga"
+  # Export formats
+  formats:
+    - "coe"   # Xilinx .coe (Coefficient file for Block RAM)
+    - "mem"   # Vivado .mem (Memory initialization file)
+    - "sv"    # SystemVerilog header with constants
+  # Bit width for LUT entries in hardware
+  hw_bit_width: 16
+  # BRAM configuration
+  bram_width: 18     # Xilinx BRAM18 native width
+  bram_depth: 1024   # Depth per BRAM18
+
+verify:
+  # Test prompt for verification
+  test_prompt: "The capital of France is"
+  # Number of tokens to generate for verification
+  num_tokens: 10
+  # Tolerance for floating-point comparison (should be exact for ternary)
+  atol: 0.0
+  rtol: 0.0
