@@ -300,10 +300,125 @@ def run_all(
     else:
         logger.info("\n[Step 5/5] Skipped (--skip-verify)")
 
+    # Bonus: Generate resource estimation report
+    logger.info("\n[Report] Generating FPGA resource estimation...")
+    from .report import generate_report
+    generate_report(output_dir, group_size, block_size, block_size)
+
     logger.info("\n" + "=" * 60)
     logger.info("Pipeline complete!")
     logger.info(f"All outputs in: {output_dir}/")
     logger.info("=" * 60)
+
+
+@main.command()
+@click.option(
+    "--output-dir", "-o",
+    default="outputs",
+    help="Pipeline output directory",
+)
+@click.option("--group-size", "-g", default=4, type=int)
+@click.option("--block-size", "-b", default=128, type=int)
+def report(output_dir: str, group_size: int, block_size: int) -> None:
+    """Generate FPGA resource estimation and statistics report."""
+    from .report import generate_report
+
+    generate_report(output_dir, group_size, block_size, block_size)
+
+
+@main.command("verify-model")
+@click.option(
+    "--model", "-m",
+    default="microsoft/bitnet-b1.58-2B-4T-bf16",
+    help="HuggingFace model for reference comparison",
+)
+@click.option(
+    "--output-dir", "-o",
+    default="outputs",
+    help="Pipeline output directory with extracted weights",
+)
+@click.option("--layer", default=0, type=int, help="Layer index to verify")
+@click.option("--group-size", "-g", default=4, type=int)
+@click.option(
+    "--prompt",
+    default="The capital of France is",
+    help="Test prompt for token-level verification",
+)
+def verify_model_cmd(
+    model: str, output_dir: str, layer: int, group_size: int, prompt: str
+) -> None:
+    """Level 3: Verify LUT emulator against PyTorch model (requires torch)."""
+    from .verify_model import (
+        verify_level3_single_layer,
+        verify_level3_token_generation,
+    )
+
+    weights_dir = f"{output_dir}/ternary_weights"
+
+    # Run single-layer verification with random activations
+    result = verify_level3_single_layer(model, weights_dir, layer, group_size)
+    if result.get("skipped"):
+        raise click.ClickException(f"Skipped: {result.get('reason')}")
+    if not result.get("all_pass", False):
+        raise click.ClickException("Level 3 single-layer verification FAILED")
+
+    # Run token-level verification (only if torch+transformers available)
+    from .verify_model import _HAS_TORCH
+    if _HAS_TORCH:
+        token_result = verify_level3_token_generation(
+            model, weights_dir, prompt=prompt, layer_idx=layer, group_size=group_size
+        )
+    else:
+        import logging
+        logging.getLogger("bitnet2lut").warning(
+            "Skipping token-level verification: PyTorch >=2.4 + transformers required"
+        )
+        token_result = {"level": 3, "skipped": True, "reason": "torch <2.4"}
+
+    from .utils import save_json
+    save_json(
+        {"single_layer": result, "token_level": token_result},
+        f"{output_dir}/level3_verification.json",
+    )
+
+@main.command("compare-tokens")
+@click.option(
+    "--model", "-m",
+    default="microsoft/bitnet-b1.58-2B-4T-bf16",
+    help="HuggingFace model for reference comparison",
+)
+@click.option(
+    "--output-dir", "-o",
+    default="outputs",
+    help="Pipeline output directory with extracted weights",
+)
+@click.option("--prompt", default="The capital of France is", help="Test prompt")
+@click.option("--max-tokens", default=10, type=int, help="Tokens to generate")
+@click.option("--group-size", "-g", default=4, type=int)
+def compare_tokens_cmd(
+    model: str, output_dir: str, prompt: str, max_tokens: int, group_size: int
+) -> None:
+    """Full token-by-token comparison: HF model vs LUT emulator vs direct ternary."""
+    from .inference import run_emulator_comparison
+    from .utils import save_json
+
+    weights_dir = f"{output_dir}/ternary_weights"
+    result = run_emulator_comparison(
+        model_path=model,
+        weights_dir=weights_dir,
+        prompt=prompt,
+        max_new_tokens=max_tokens,
+        group_size=group_size,
+    )
+
+    save_json(result, f"{output_dir}/token_comparison.json")
+
+    if result.get("lut_vs_direct_match"):
+        click.echo("✅ LUT emulator matches direct ternary matmul")
+    if result.get("lut_vs_hf_match"):
+        click.echo("✅ LUT emulator matches HuggingFace model")
+    else:
+        click.echo("⚠️  Tokens differ from HF (expected — see token_comparison.json)")
 
 
 if __name__ == "__main__":

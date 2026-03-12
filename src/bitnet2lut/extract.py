@@ -123,6 +123,20 @@ def validate_ternary(tensor: torch.Tensor, name: str) -> WeightStats:
     )
 
 
+def _torch_to_numpy(tensor: torch.Tensor) -> np.ndarray:
+    """Convert a torch tensor to numpy, with fallback for broken numpy bridge.
+
+    When PyTorch is built against numpy 1.x but numpy 2.x is installed,
+    tensor.numpy() raises RuntimeError. This falls back to copying via
+    the raw data buffer.
+    """
+    try:
+        return tensor.numpy()
+    except RuntimeError:
+        # Fallback: go through python list (slower but always works)
+        return np.array(tensor.tolist(), dtype=np.int8).reshape(tensor.shape)
+
+
 def extract_weights(
     model_path: str | Path,
     output_dir: str | Path,
@@ -195,7 +209,7 @@ def extract_weights(
 
             # Store
             key = proj_name.replace(".", "_")
-            layer_weights[key] = ternary.numpy()
+            layer_weights[key] = _torch_to_numpy(ternary)
             layer_alphas[key] = alpha
 
             total_params += stats.num_params

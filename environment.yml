@@ -9,11 +9,13 @@ dependencies:
   - pip>=23.0
 
   # Core scientific stack
-  - numpy>=1.24
+  # IMPORTANT: PyTorch from the pytorch channel is built against numpy 1.x.
+  # Using numpy 2.x causes "Numpy is not available" RuntimeError.
+  - numpy>=1.24,<2.0
   - pyyaml>=6.0
 
   # PyTorch (CPU-only — we don't need GPU for weight extraction)
-  - pytorch>=2.1
+  - pytorch>=2.4
   - cpuonly
 
   # CLI and display
@@ -31,3 +33,4 @@ dependencies:
       - safetensors>=0.4.0
       - transformers>=4.45.0
       - huggingface-hub>=0.20.0
+      - accelerate>=0.25.0
