@@ -447,6 +447,8 @@ class BitNetEmulator:
             # After last layer: final norm + LM head
             # (only need logits from the last prompt token)
 
+        self._last_hidden = hidden.copy()
+
         # Now generate new tokens
         for step in range(max_new_tokens):
             # Final norm
@@ -545,6 +547,28 @@ def run_emulator_comparison(
     lut_tokens = emulator.generate(input_ids, max_new_tokens=max_new_tokens, temperature=0.0)
     lut_text = tokenizer.decode(lut_tokens, skip_special_tokens=True)
     logger.info(f"LUT output: '{lut_text}'")
+
+    # Diagnostic: show top-10 logits from the last generation step
+    # to verify "Paris" is ranked high even if it didn't win argmax
+    logger.info("--- Logit diagnostic (last token step) ---")
+    # Re-run last token through final norm + LM head to get logits
+    last_hidden = emulator._last_hidden  # we need to save this — see below
+    diag_output = rms_norm(last_hidden, emulator.final_norm_weight.astype(np.float32), emulator.config.rms_norm_eps)
+    diag_logits = emulator.embed_tokens.astype(np.float32) @ diag_output
+    top_indices = np.argsort(diag_logits)[::-1][:10]
+    for rank, idx in enumerate(top_indices):
+        token_str = tokenizer.decode([idx])
+        logger.info(f"  Rank {rank+1}: id={idx} '{token_str}' logit={diag_logits[idx]:.4f}")
+    # Also check where HF's first generated token ranks
+    hf_first_token = hf_tokens[len(input_ids)]
+    hf_rank = int(np.where(top_indices == hf_first_token)[0][0]) + 1 if hf_first_token in top_indices else None
+    if hf_rank:
+        logger.info(f"  HF's token '{tokenizer.decode([hf_first_token])}' is rank {hf_rank}")
+    else:
+        full_ranking = np.argsort(diag_logits)[::-1]
+        hf_rank = int(np.where(full_ranking == hf_first_token)[0][0]) + 1
+        logger.info(f"  HF's token '{tokenizer.decode([hf_first_token])}' is rank {hf_rank} (not in top 10)")
+
 
     # Path 3: Direct ternary — reuse same emulator, just flip the flag
     logger.info("Running direct ternary emulator...")
