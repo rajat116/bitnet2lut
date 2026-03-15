@@ -58,7 +58,7 @@ proc run_synthesis {G K PART SRC_DIR XDC_DIR OUT_DIR} {
     
     # Create project
     create_project $proj_name $proj_dir -part $PART -force
-    set_property target_language SystemVerilog [current_project]
+    set_property target_language Verilog [current_project]
     
     # Add source files
     add_files [glob ${SRC_DIR}/*.sv]
@@ -168,7 +168,7 @@ proc run_simulation {G K PART SRC_DIR TB_DIR OUT_DIR} {
     }
     
     create_project $proj_name $proj_dir -part $PART -force
-    set_property target_language SystemVerilog [current_project]
+    set_property target_language Verilog [current_project]
     
     # Add source files
     add_files [glob ${SRC_DIR}/*.sv]

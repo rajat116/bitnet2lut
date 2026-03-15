@@ -46,7 +46,7 @@ if {[file exists $proj_dir]} {
 }
 
 create_project $proj_name $proj_dir -part $PART -force
-set_property target_language SystemVerilog [current_project]
+set_property target_language Verilog [current_project]
 
 add_files [glob ${SRC_DIR}/*.sv]
 add_files -fileset constrs_1 ${XDC_DIR}/timing.xdc
