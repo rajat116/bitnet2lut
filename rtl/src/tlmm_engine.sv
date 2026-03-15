@@ -1,3 +1,4 @@
+`timescale 1ns / 1ps
 // ============================================================================
 // tlmm_engine.sv — Table Lookup Matrix Multiply Engine
 // Vivado 2020.2 compatible
@@ -11,10 +12,10 @@ module tlmm_engine #(
     parameter K               = 2560,
     parameter VALUE_WIDTH     = 16,
     parameter ACC_WIDTH       = 32,
-    parameter NUM_LUT_ENTRIES = 81,   // 3^G: pass 27 for G=3, 81 for G=4
-    parameter LUT_ADDR_W     = 7,    // ceil(log2(NUM_LUT_ENTRIES)): 5 for G=3, 7 for G=4
-    parameter NUM_GROUPS      = 640,  // ceil(K/G)
-    parameter GROUP_IDX_W    = 10    // ceil(log2(NUM_GROUPS))
+    parameter NUM_LUT_ENTRIES = 81,
+    parameter LUT_ADDR_W     = 7,
+    parameter NUM_GROUPS      = 640,
+    parameter GROUP_IDX_W    = 10
 ) (
     input  wire                      clk,
     input  wire                      rst_n,
@@ -23,21 +24,17 @@ module tlmm_engine #(
     output reg                       done,
     output reg                       busy,
 
-    // Activation LUT write port
     input  wire                      lut_wen,
     input  wire [LUT_ADDR_W-1:0]    lut_waddr,
     input  wire [VALUE_WIDTH-1:0]    lut_wdata,
 
-    // Weight index read port
     output wire [GROUP_IDX_W-1:0]    widx_addr,
     input  wire [LUT_ADDR_W-1:0]    widx_data,
 
-    // Output
     output reg  [ACC_WIDTH-1:0]      result,
     output reg                       result_valid
 );
 
-    // Activation LUT storage
     reg [VALUE_WIDTH-1:0] act_lut [0:NUM_LUT_ENTRIES-1];
 
     always @(posedge clk) begin
@@ -45,14 +42,11 @@ module tlmm_engine #(
             act_lut[lut_waddr] <= lut_wdata;
     end
 
-    // FSM states
     localparam IDLE   = 2'd0;
     localparam FETCH  = 2'd1;
     localparam FINISH = 2'd2;
 
     reg [1:0] state;
-
-    // Counters and pipeline
     reg [GROUP_IDX_W-1:0]   group_cnt;
     reg [ACC_WIDTH-1:0]     accumulator;
     reg                     pipe_valid_s1, pipe_valid_s2;
@@ -95,25 +89,20 @@ module tlmm_engine #(
                 end
 
                 FETCH: begin
-                    // Pipeline stage 1: capture weight index from BRAM
                     pipe_valid_s1 <= ~issuing_done;
                     pipe_last_s1  <= (group_cnt == NUM_GROUPS - 1);
                     widx_data_s1  <= widx_data;
 
-                    // Pipeline stage 2: read LUT
                     pipe_valid_s2  <= pipe_valid_s1;
                     pipe_last_s2   <= pipe_last_s1;
                     partial_sum_s2 <= act_lut[widx_data_s1];
 
-                    // Accumulate
                     if (pipe_valid_s2)
                         accumulator <= accumulator + {{(ACC_WIDTH-VALUE_WIDTH){partial_sum_s2[VALUE_WIDTH-1]}}, partial_sum_s2};
 
-                    // Pipeline drain check
                     if (pipe_valid_s2 && pipe_last_s2)
                         state <= FINISH;
 
-                    // Advance counter
                     if (!issuing_done) begin
                         if (group_cnt == NUM_GROUPS - 1)
                             issuing_done <= 1'b1;

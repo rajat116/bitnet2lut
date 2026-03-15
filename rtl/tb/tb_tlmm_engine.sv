@@ -1,11 +1,10 @@
+`timescale 1ns / 1ps
 // ============================================================================
 // tb_tlmm_engine.sv — Testbench for TLMM Engine
-// Vivado 2020.2 compatible (no automatic, no logic, minimal SV)
+// Vivado 2020.2 compatible
 //
 // Author: Rajat Gupta
 // ============================================================================
-
-`timescale 1ns / 1ps
 
 `ifndef TEST_G
 `define TEST_G 4
@@ -17,13 +16,11 @@
 
 module tb_tlmm_engine;
 
-    // Parameters
     localparam G           = `TEST_G;
     localparam K           = `TEST_K;
     localparam VALUE_WIDTH = 16;
     localparam ACC_WIDTH   = 32;
 
-    // Derived (must match tlmm_top logic)
     localparam NUM_LUT_ENTRIES = (G == 3) ? 27 : (G == 4) ? 81 : (G == 5) ? 243 : 9;
     localparam LUT_ADDR_W = (G == 3) ? 5 : (G == 4) ? 7 : (G == 5) ? 8 : 4;
     localparam NUM_GROUPS = (K + G - 1) / G;
@@ -33,13 +30,11 @@ module tb_tlmm_engine;
                              (NUM_GROUPS <= 2048) ? 11 :
                              (NUM_GROUPS <= 4096) ? 12 : 13;
 
-    // Clock and reset
     reg clk;
     reg rst_n;
     initial clk = 0;
-    always #2.5 clk = ~clk;  // 200 MHz
+    always #2.5 clk = ~clk;
 
-    // DUT signals
     reg                    act_lut_wen;
     reg  [6:0]             act_lut_waddr;
     reg  [VALUE_WIDTH-1:0] act_lut_wdata;
@@ -52,7 +47,6 @@ module tb_tlmm_engine;
     wire [ACC_WIDTH-1:0]   result;
     wire                   result_valid;
 
-    // DUT
     tlmm_top #(
         .G          (G),
         .K          (K),
@@ -78,22 +72,29 @@ module tb_tlmm_engine;
     reg signed [VALUE_WIDTH-1:0] tv_act_lut [0:NUM_LUT_ENTRIES-1];
     reg [LUT_ADDR_W-1:0]         tv_widx    [0:NUM_GROUPS-1];
 
-    // Counters
+    // Working variables
     integer cycle_count;
     integer num_passed;
     integer num_failed;
-    integer i, t;
-    integer lfsr;
+    integer i, j, t;
+    reg [31:0] lfsr;
     integer temp, trit;
     integer signed w_val;
     integer signed partial;
-    integer signed act_vals_0, act_vals_1, act_vals_2, act_vals_3;
+    integer signed act_vals [0:3];  // max G=4
     reg signed [ACC_WIDTH-1:0] expected;
     integer idx;
 
-    // ---------------------------------------------------------------
-    // Main test
-    // ---------------------------------------------------------------
+    // Simple LFSR step function — called explicitly each time
+    // Uses xorshift32 for better distribution than LCG
+    task lfsr_step;
+        begin
+            lfsr = lfsr ^ (lfsr << 13);
+            lfsr = lfsr ^ (lfsr >> 17);
+            lfsr = lfsr ^ (lfsr << 5);
+        end
+    endtask
+
     initial begin
         act_lut_wen   = 0;
         act_lut_waddr = 0;
@@ -105,7 +106,6 @@ module tb_tlmm_engine;
         num_passed    = 0;
         num_failed    = 0;
 
-        // Reset
         rst_n = 0;
         repeat (10) @(posedge clk);
         rst_n = 1;
@@ -119,66 +119,43 @@ module tb_tlmm_engine;
         for (t = 0; t < 5; t = t + 1) begin
             $display("\n--- Test %0d ---", t);
 
-            // Generate test vectors with deterministic LFSR
-            lfsr = 42 + t * 1000;
+            // Seed LFSR (different per test, avoid 0)
+            lfsr = 32'd100001 + t * 32'd77773;
 
-            // Generate activation values (G values)
-            lfsr = lfsr * 1103515245 + 12345;
-            act_vals_0 = ((lfsr >> 16) & 8'hFF);
-            if (act_vals_0 > 127) act_vals_0 = act_vals_0 - 256;
-
-            lfsr = lfsr * 1103515245 + 12345;
-            act_vals_1 = ((lfsr >> 16) & 8'hFF);
-            if (act_vals_1 > 127) act_vals_1 = act_vals_1 - 256;
-
-            lfsr = lfsr * 1103515245 + 12345;
-            act_vals_2 = ((lfsr >> 16) & 8'hFF);
-            if (act_vals_2 > 127) act_vals_2 = act_vals_2 - 256;
-
-            if (G >= 4) begin
-                lfsr = lfsr * 1103515245 + 12345;
-                act_vals_3 = ((lfsr >> 16) & 8'hFF);
-                if (act_vals_3 > 127) act_vals_3 = act_vals_3 - 256;
-            end else begin
-                act_vals_3 = 0;
+            // Generate G activation values (INT8 range)
+            for (j = 0; j < G; j = j + 1) begin
+                lfsr_step;
+                act_vals[j] = (lfsr[7:0] > 127) ? (lfsr[7:0] - 256) : lfsr[7:0];
+            end
+            // Zero unused slots
+            for (j = G; j < 4; j = j + 1) begin
+                act_vals[j] = 0;
             end
 
-            // Build LUT: for each entry, compute partial dot product
+            // Build LUT: for each entry compute partial dot product with activations
             for (i = 0; i < NUM_LUT_ENTRIES; i = i + 1) begin
                 partial = 0;
                 temp = i;
-
-                trit = temp % 3; temp = temp / 3;
-                w_val = trit - 1;
-                partial = partial + w_val * act_vals_0;
-
-                trit = temp % 3; temp = temp / 3;
-                w_val = trit - 1;
-                partial = partial + w_val * act_vals_1;
-
-                trit = temp % 3; temp = temp / 3;
-                w_val = trit - 1;
-                partial = partial + w_val * act_vals_2;
-
-                if (G >= 4) begin
+                for (j = 0; j < G; j = j + 1) begin
                     trit = temp % 3;
-                    w_val = trit - 1;
-                    partial = partial + w_val * act_vals_3;
+                    temp = temp / 3;
+                    w_val = trit - 1;  // {-1, 0, +1}
+                    partial = partial + w_val * act_vals[j];
                 end
-
                 tv_act_lut[i] = partial[VALUE_WIDTH-1:0];
             end
 
-            // Generate weight indices and compute expected
+            // Generate weight indices and compute expected result
             expected = 0;
             for (i = 0; i < NUM_GROUPS; i = i + 1) begin
-                lfsr = lfsr * 1103515245 + 12345;
-                idx = ((lfsr >> 16) & 32'h7FFFFFFF) % NUM_LUT_ENTRIES;
+                lfsr_step;
+                idx = lfsr[30:0] % NUM_LUT_ENTRIES;  // use 31 bits, positive
                 tv_widx[i] = idx[LUT_ADDR_W-1:0];
+                // Sign-extend partial sum and accumulate
                 expected = expected + {{(ACC_WIDTH-VALUE_WIDTH){tv_act_lut[idx][VALUE_WIDTH-1]}}, tv_act_lut[idx]};
             end
 
-            // Load activation LUT
+            // Load activation LUT into DUT
             for (i = 0; i < NUM_LUT_ENTRIES; i = i + 1) begin
                 @(posedge clk);
                 act_lut_wen   <= 1'b1;
@@ -188,7 +165,7 @@ module tb_tlmm_engine;
             @(posedge clk);
             act_lut_wen <= 1'b0;
 
-            // Load weight indices
+            // Load weight indices into DUT
             for (i = 0; i < NUM_GROUPS; i = i + 1) begin
                 @(posedge clk);
                 widx_wen   <= 1'b1;
@@ -198,7 +175,6 @@ module tb_tlmm_engine;
             @(posedge clk);
             widx_wen <= 1'b0;
 
-            // Small gap
             repeat (2) @(posedge clk);
 
             // Start computation
@@ -214,7 +190,7 @@ module tb_tlmm_engine;
                 cycle_count = cycle_count + 1;
             end
 
-            // Check
+            // Check result
             if ($signed(result) == expected) begin
                 $display("TEST %0d PASSED: result=%0d expected=%0d cycles=%0d",
                          t, $signed(result), expected, cycle_count);
@@ -226,7 +202,6 @@ module tb_tlmm_engine;
             end
         end
 
-        // Summary
         $display("\n============================================================");
         $display("SUMMARY: G=%0d K=%0d", G, K);
         $display("  Passed: %0d / 5", num_passed);
@@ -243,7 +218,6 @@ module tb_tlmm_engine;
         $finish;
     end
 
-    // Timeout
     initial begin
         #50000000;
         $display("TIMEOUT!");
