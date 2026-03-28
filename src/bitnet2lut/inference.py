@@ -38,6 +38,7 @@ and uses the stored ternary weights directly.
 import logging
 import math
 from pathlib import Path
+import json as _json  # for loading thresholds
 
 import numpy as np
 
@@ -120,6 +121,53 @@ def int8_absmax_quantize(x: np.ndarray) -> tuple[np.ndarray, float]:
     quantized = np.clip(np.round(x / scale), -128, 127).astype(np.int8)
     return quantized, scale
 
+def int4_absmax_quantize(x: np.ndarray) -> tuple[np.ndarray, float]:
+    """Per-token INT4 absmax quantization — EXPERIMENTAL.
+
+    Same scheme as INT8 but maps to [-7, 7] (7 = 2^(4-1) - 1).
+    Values are stored as int8 but clipped to the 4-bit range.
+
+    This is NOT how the model was trained. We use this to measure
+    how much accuracy degrades when we reduce activation precision
+    below INT8 at inference time without retraining.
+
+    Args:
+        x: (hidden_size,) float activation vector
+
+    Returns:
+        (quantized_int8, scale) where values are in [-7, 7]
+    """
+    abs_max = np.max(np.abs(x))
+    if abs_max < 1e-10:
+        return np.zeros_like(x, dtype=np.int8), 1.0
+    scale = abs_max / 7.0           # <-- 7 instead of 127
+    quantized = np.clip(np.round(x / scale), -8, 7).astype(np.int8)
+    return quantized, scale
+
+def lloyd_max_quantize(
+    x: np.ndarray,
+    thresholds: np.ndarray,
+    levels: np.ndarray,
+) -> tuple[np.ndarray, float]:
+    """Quantize using precomputed Lloyd-Max thresholds and levels.
+
+    Instead of uniform spacing, uses optimal thresholds derived from
+    the measured activation distribution of this specific layer.
+
+    Args:
+        x: (hidden_size,) float activation vector
+        thresholds: (n_levels - 1,) precomputed decision boundaries
+        levels: (n_levels,) precomputed reconstruction values
+
+    Returns:
+        (quantized, scale) where quantized contains the reconstruction
+        level indices stored as int8, and scale=1.0 (levels are already
+        in float space, dequantization happens via the levels array)
+    """
+    bin_indices = np.digitize(x, thresholds)
+    # Clip to valid range (digitize can return n_levels for values > last threshold)
+    bin_indices = np.clip(bin_indices, 0, len(levels) - 1)
+    return bin_indices, 1.0  # scale unused — dequant uses levels array directly
 
 def bitlinear_forward_lut(
     x: np.ndarray,
@@ -129,6 +177,10 @@ def bitlinear_forward_lut(
     sub_norm_eps: float = 1e-5,
     group_size: int = 4,
     use_lut: bool = True,
+    activation_bits: int = 8,        # <-- ADD THIS, default=8 keeps old behavior
+    activation_collector: dict | None = None,  # <-- ADD THIS
+    lm_thresholds: np.ndarray | None = None,  # <-- ADD
+    lm_levels: np.ndarray | None = None,       # <-- ADD
 ) -> np.ndarray:
     """Execute one BitLinear layer using LUT or direct ternary matmul.
 
@@ -153,8 +205,26 @@ def bitlinear_forward_lut(
     """
     out_dim, in_dim = ternary_weight.shape
 
-    # Quantize activation to INT8
-    x_int8, act_scale = int8_absmax_quantize(x)
+    # Collect raw activation values if collector provided
+    if activation_collector is not None:
+        key = activation_collector.get("_current_key", "unknown")
+        if key not in activation_collector:
+            activation_collector[key] = []
+        activation_collector[key].append(x.copy())
+
+    # Quantize activation
+    if lm_thresholds is not None and lm_levels is not None:
+        # Lloyd-Max non-uniform quantization
+        bin_indices, _ = lloyd_max_quantize(x, lm_thresholds, lm_levels)
+        # Reconstruct using levels for the matmul
+        # We dequantize immediately and treat as float input to matmul
+        x_reconstructed = lm_levels[bin_indices].astype(np.float32)
+        # Now quantize the reconstructed values to INT8 for the ternary matmul
+        x_int8, act_scale = int8_absmax_quantize(x_reconstructed)
+    elif activation_bits == 4:
+        x_int8, act_scale = int4_absmax_quantize(x)
+    else:
+        x_int8, act_scale = int8_absmax_quantize(x)
 
     # Pad for group alignment
     pad = (group_size - in_dim % group_size) % group_size
@@ -196,6 +266,7 @@ class BitNetEmulator:
         model_path: str,
         group_size: int = 4,
         use_lut: bool = True,
+        activation_bits: int = 8,        # <-- ADD THIS
     ):
         """Initialize the emulator.
 
@@ -210,6 +281,10 @@ class BitNetEmulator:
         self.weights_dir = Path(weights_dir)
         self.group_size = group_size
         self.use_lut = use_lut
+        self.activation_bits = activation_bits
+        self.activation_collector = None  # set externally to enable collection
+        self.lm_thresholds = {}   # key: layer_idx -> np.ndarray
+        self.lm_levels = {}       # key: layer_idx -> np.ndarray
 
         # Load non-ternary weights from HuggingFace
         self._load_model_weights(model_path)
@@ -270,6 +345,20 @@ class BitNetEmulator:
 
         logger.info(f"Loaded ternary weights for {self.config.num_hidden_layers} layers")
 
+    def load_lloydmax_thresholds(self, thresholds_path: str) -> None:
+        """Load precomputed Lloyd-Max thresholds for down_proj layers."""
+        with open(thresholds_path) as f:
+            data = _json.load(f)
+
+        for key, entry in data.items():
+            # key is like "layer_000.mlp.down_proj"
+            layer_str = key.split(".")[0]  # "layer_000"
+            layer_idx = int(layer_str.split("_")[1])
+            self.lm_thresholds[layer_idx] = np.array(entry["thresholds"], dtype=np.float32)
+            self.lm_levels[layer_idx] = np.array(entry["levels"], dtype=np.float32)
+
+        logger.info(f"Loaded Lloyd-Max thresholds for {len(self.lm_thresholds)} down_proj layers")
+
     def _get_norm_weight(self, name: str) -> np.ndarray:
         """Get a norm weight from fp_weights."""
         return self.fp_weights[name].astype(np.float32)
@@ -306,9 +395,13 @@ class BitNetEmulator:
         def proj(proj_name):
             w = self.ternary_weights[(layer_idx, proj_name)]
             a = self.alphas[(layer_idx, proj_name)]
+            if self.activation_collector is not None:
+                self.activation_collector["_current_key"] = f"layer_{layer_idx:03d}.{proj_name}"
             return bitlinear_forward_lut(
                 hidden_states, w, a,
                 group_size=self.group_size, use_lut=self.use_lut,
+                activation_bits=self.activation_bits,
+                activation_collector=self.activation_collector,
             )
 
         q = proj("self_attn.q_proj")  # (2560,)
@@ -407,9 +500,18 @@ class BitNetEmulator:
         # Down projection (BitLinear)
         w = self.ternary_weights[(layer_idx, "mlp.down_proj")]
         a = self.alphas[(layer_idx, "mlp.down_proj")]
+        if self.activation_collector is not None:
+            self.activation_collector["_current_key"] = f"layer_{layer_idx:03d}.mlp.down_proj"
+        # Use Lloyd-Max thresholds for down_proj if available
+        lm_thresh = self.lm_thresholds.get(layer_idx)
+        lm_levs = self.lm_levels.get(layer_idx)
         hidden_states = bitlinear_forward_lut(
             ffn_hidden, w, a,
             group_size=self.group_size, use_lut=self.use_lut,
+            activation_bits=self.activation_bits,
+            activation_collector=self.activation_collector,
+            lm_thresholds=lm_thresh,
+            lm_levels=lm_levs,
         )
 
         # Residual connection
