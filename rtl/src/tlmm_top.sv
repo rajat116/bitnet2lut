@@ -9,7 +9,8 @@
 module tlmm_top #(
     parameter G           = 4,
     parameter K           = 2560,
-    parameter VALUE_WIDTH = 16,
+    parameter ACT_WIDTH   = 8,
+    parameter VALUE_WIDTH = (ACT_WIDTH == 4) ? 8 : 16,
     parameter ACC_WIDTH   = 32
 ) (
     input  wire                    clk,

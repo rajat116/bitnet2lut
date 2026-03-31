@@ -169,6 +169,51 @@ def lloyd_max_quantize(
     bin_indices = np.clip(bin_indices, 0, len(levels) - 1)
     return bin_indices, 1.0  # scale unused — dequant uses levels array directly
 
+def int4_exception_aware_quantize(
+    x: np.ndarray,
+    exc_threshold: float,
+) -> tuple[np.ndarray, float, np.ndarray]:
+    """INT4 quantization with INT8 exception path for outliers.
+
+    Bulk (99% of values): INT4 absmax using p99 as scale.
+    Exceptions (|x| > threshold): INT8 absmax using full range.
+
+    Args:
+        x: float activation vector
+        exc_threshold: p99 value — hardwired at synthesis time on FPGA
+
+    Returns:
+        (quantized, scale, exception_mask)
+        quantized: int8 array, INT4 range for bulk, INT8 range for exceptions
+        scale: bulk scale factor (threshold / 7.0)
+        exception_mask: bool array, True where INT8 was used
+    """
+    exc_mask = np.abs(x) > exc_threshold
+
+    # Bulk: INT4 with p99 as scale
+    bulk_scale = exc_threshold / 7.0
+    quantized = np.clip(np.round(x / bulk_scale), -8, 7).astype(np.int8)
+
+    # Exceptions: override with INT8 full precision
+    if np.any(exc_mask):
+        abs_max = np.max(np.abs(x[exc_mask]))
+        if abs_max > 1e-10:
+            exc_scale = abs_max / 127.0
+            quantized[exc_mask] = np.clip(
+                np.round(x[exc_mask] / exc_scale), -128, 127
+            ).astype(np.int8)
+            # Store exception values at their own scale
+            # For dequantization: bulk uses bulk_scale, exceptions use exc_scale
+            # We reconstruct by dequantizing separately
+            x_reconstructed = quantized.astype(np.float32) * bulk_scale
+            x_reconstructed[exc_mask] = (
+                quantized[exc_mask].astype(np.float32) * exc_scale
+            )
+            return x_reconstructed, bulk_scale, exc_mask
+
+    x_reconstructed = quantized.astype(np.float32) * bulk_scale
+    return x_reconstructed, bulk_scale, exc_mask
+
 def bitlinear_forward_lut(
     x: np.ndarray,
     ternary_weight: np.ndarray,
@@ -181,6 +226,7 @@ def bitlinear_forward_lut(
     activation_collector: dict | None = None,  # <-- ADD THIS
     lm_thresholds: np.ndarray | None = None,  # <-- ADD
     lm_levels: np.ndarray | None = None,       # <-- ADD
+    exc_threshold: float | None = None,   # <-- ADD THIS
 ) -> np.ndarray:
     """Execute one BitLinear layer using LUT or direct ternary matmul.
 
@@ -213,13 +259,16 @@ def bitlinear_forward_lut(
         activation_collector[key].append(x.copy())
 
     # Quantize activation
-    if lm_thresholds is not None and lm_levels is not None:
-        # Lloyd-Max non-uniform quantization
+    if exc_threshold is not None:
+        # Exception-aware: INT4 bulk + INT8 for outliers
+        x_reconstructed, act_scale, _ = int4_exception_aware_quantize(
+            x, exc_threshold
+        )
+        # Re-quantize reconstructed values to INT8 for ternary matmul
+        x_int8, act_scale = int8_absmax_quantize(x_reconstructed)
+    elif lm_thresholds is not None and lm_levels is not None:
         bin_indices, _ = lloyd_max_quantize(x, lm_thresholds, lm_levels)
-        # Reconstruct using levels for the matmul
-        # We dequantize immediately and treat as float input to matmul
         x_reconstructed = lm_levels[bin_indices].astype(np.float32)
-        # Now quantize the reconstructed values to INT8 for the ternary matmul
         x_int8, act_scale = int8_absmax_quantize(x_reconstructed)
     elif activation_bits == 4:
         x_int8, act_scale = int4_absmax_quantize(x)
@@ -285,6 +334,7 @@ class BitNetEmulator:
         self.activation_collector = None  # set externally to enable collection
         self.lm_thresholds = {}   # key: layer_idx -> np.ndarray
         self.lm_levels = {}       # key: layer_idx -> np.ndarray
+        self.exc_thresholds = {}  # key: layer_idx -> float (p99 value)
 
         # Load non-ternary weights from HuggingFace
         self._load_model_weights(model_path)
@@ -358,6 +408,32 @@ class BitNetEmulator:
             self.lm_levels[layer_idx] = np.array(entry["levels"], dtype=np.float32)
 
         logger.info(f"Loaded Lloyd-Max thresholds for {len(self.lm_thresholds)} down_proj layers")
+
+    def load_exception_thresholds(self, stats_path: str) -> None:
+        """Load p99 thresholds for exception-aware quantization.
+
+        Reads from the activation_stats.json produced by measure_activations.py.
+        Only loads thresholds for down_proj layers.
+
+        Args:
+            stats_path: path to activation_stats.json
+        """
+        with open(stats_path) as f:
+            stats = _json.load(f)
+
+        for key, entry in stats.items():
+            if "down_proj" not in key:
+                continue
+            # key is like "layer_000.mlp.down_proj"
+            layer_str = key.split(".")[0]
+            layer_idx = int(layer_str.split("_")[1])
+            self.exc_thresholds[layer_idx] = float(entry["p99"])
+
+        logger.info(
+            f"Loaded exception thresholds for "
+            f"{len(self.exc_thresholds)} down_proj layers"
+        )
+
 
     def _get_norm_weight(self, name: str) -> np.ndarray:
         """Get a norm weight from fp_weights."""
@@ -505,6 +581,7 @@ class BitNetEmulator:
         # Use Lloyd-Max thresholds for down_proj if available
         lm_thresh = self.lm_thresholds.get(layer_idx)
         lm_levs = self.lm_levels.get(layer_idx)
+        exc_thresh = self.exc_thresholds.get(layer_idx)
         hidden_states = bitlinear_forward_lut(
             ffn_hidden, w, a,
             group_size=self.group_size, use_lut=self.use_lut,
@@ -512,6 +589,7 @@ class BitNetEmulator:
             activation_collector=self.activation_collector,
             lm_thresholds=lm_thresh,
             lm_levels=lm_levs,
+            exc_threshold=exc_thresh,
         )
 
         # Residual connection
